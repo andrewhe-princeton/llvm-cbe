@@ -37,6 +37,7 @@
 #include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include <iostream>
 
 // Jackson Korba 9/29/14
 #ifndef DEBUG_TYPE
@@ -3160,10 +3161,11 @@ void CWriter::printConstant(Constant *CPV, enum OperandContext Context) {
       // Because of FP precision problems we must load from a stack allocated
       // value that holds the value in hex.
       Out << "(*("
-          << (FPC->getType() == Type::getFloatTy(CPV->getContext()) ? "float"
-              : FPC->getType() == Type::getDoubleTy(CPV->getContext())
-                  ? "double"
-                  : "long double")
+          << (FPC->getType() == Type::getFloatTy(CPV->getContext())
+                  ? "float"
+                  : FPC->getType() == Type::getDoubleTy(CPV->getContext())
+                        ? "double"
+                        : "long double")
           << "*)&FPConstant" << I->second << ')';
     } else {
       double V;
@@ -4237,6 +4239,15 @@ static void defineThreadFence(raw_ostream &Out) {
       << "#endif\n\n";
 }
 
+static void defineTrap(raw_ostream &Out) {
+  Out << "extern void abort(void);\n"
+      << "#if defined(__GNUC__)\n"
+      << "extern void __builtin_trap(void);\n"
+      << "#else\n"
+      << "#define __builtin_trap() abort()\n"
+      << "#endif\n\n";
+}
+
 /// FindStaticTors - Given a static ctor/dtor list, unpack its contents into
 /// the StaticTors set.
 static void FindStaticTors(GlobalVariable *GV,
@@ -4766,6 +4777,8 @@ void CWriter::generateHeader(Module &M) {
       case Intrinsic::rint:
       case Intrinsic::sqrt:
       case Intrinsic::trunc:
+      case Intrinsic::smin:
+      case Intrinsic::smax:
         intrinsicsToDefine.push_back(&*I);
         continue;
       }
@@ -8638,6 +8651,8 @@ void CWriter::printIntrinsicDefinition(FunctionType *funT, unsigned Opcode,
   case Intrinsic::sadd_with_overflow:
   case Intrinsic::ssub_with_overflow:
   case Intrinsic::smul_with_overflow:
+  case Intrinsic::smax:
+  case Intrinsic::smin:
     isSigned = true;
     break;
   }
@@ -8793,6 +8808,14 @@ void CWriter::printIntrinsicDefinition(FunctionType *funT, unsigned Opcode,
         Out << ")";
       Out << ";\n";
       break;
+
+    case Intrinsic::smax:
+      Out << "r = a > b ? a :b;\n";
+      break;
+
+    case Intrinsic::smin:
+      Out << "r = a < b ? a :b; \n";
+      break;
     }
 
   } else {
@@ -8871,6 +8894,7 @@ void CWriter::printIntrinsicDefinition(Function &F, raw_ostream &Out) {
   FunctionType *funT = F.getFunctionType();
   unsigned Opcode = F.getIntrinsicID();
   std::string OpName = GetValueName(&F);
+  std::cerr << "ANDREW: OpName:" << OpName << '\n';
   printIntrinsicDefinition(funT, Opcode, OpName, Out);
 }
 
@@ -8928,6 +8952,8 @@ bool CWriter::lowerIntrinsics(Function &F) {
           case Intrinsic::stackprotector:
           case Intrinsic::dbg_value:
           case Intrinsic::dbg_declare:
+          case Intrinsic::smax:
+          case Intrinsic::smin:
             // We directly implement these intrinsics
             break;
 
@@ -9336,7 +9362,8 @@ void CWriter::visitCallInst(CallInst &I) {
    */
   if (ompFuncs.find(&I) != ompFuncs.end()) {
     Out << "//START OUTLINED\n";
-    Out << "  #pragma omp parallel \n" << "{\n";
+    Out << "  #pragma omp parallel \n"
+        << "{\n";
     // Create a Call to omp_outlined
     auto utask = ompFuncs[&I];
 
@@ -9823,6 +9850,8 @@ bool CWriter::visitBuiltinCall(CallInst &I, Intrinsic::ID ID) {
   case Intrinsic::sqrt:
   case Intrinsic::trap:
   case Intrinsic::trunc:
+  case Intrinsic::smax:
+  case Intrinsic::smin:
     return false; // these use the normal function call emission
   }
 }
