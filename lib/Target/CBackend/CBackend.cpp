@@ -6966,6 +6966,45 @@ void CWriter::printCmpOperator(ICmpInst *icmp, bool negateCondition) {
   }
 }
 
+// GEMINI OUTPUT: CHECK
+// Helper function (conceptual) to find the PHI node being updated by I
+PHINode *CWriter::findUpdatedAccumulatorPHI(Instruction *I) {
+  if (!I || !I->getParent() || !LI)
+    return nullptr;
+  Loop *L = LI->getLoopFor(I->getParent());
+  if (!L)
+    return nullptr;
+  BasicBlock *loopHeader = L->getHeader();
+  if (!loopHeader)
+    return nullptr;
+
+  PHINode *potentialPhiTarget =
+      nullptr; // The PHI this instruction might be feeding
+
+  // Find if any user is a PHI in the loop header
+  for (User *U : I->users()) {
+    if (PHINode *phiUser = dyn_cast<PHINode>(U)) {
+      if (phiUser->getParent() == loopHeader) {
+        potentialPhiTarget = phiUser;
+        break; // Found a potential PHI target in the header
+      }
+    }
+  }
+
+  if (!potentialPhiTarget)
+    return nullptr; // Instruction doesn't feed a header PHI
+
+  // Now, check if this instruction uses the *same* PHI as an operand
+  for (unsigned opIdx = 0; opIdx < I->getNumOperands(); ++opIdx) {
+    if (I->getOperand(opIdx) == potentialPhiTarget) {
+      // Confirmation: I uses the PHI it feeds back into
+      return potentialPhiTarget;
+    }
+  }
+
+  return nullptr; // Didn't find the direct feedback pattern
+} // namespace llvm_cbe
+
 void CWriter::printInstruction(Instruction *I, bool printSemiColon) {
   if (I->getMetadata("tulip.target.end.of.map"))
     return;
@@ -6980,20 +7019,74 @@ void CWriter::printInstruction(Instruction *I, bool printSemiColon) {
     return;
   if (deadInsts.find(I) != deadInsts.end())
     return;
+
+  // GEMINI CODE -----------
+  if (isSkipableInst(I))
+    return; // Keep this check
+  PHINode *targetPhi = findUpdatedAccumulatorPHI(I);
+  bool isAccumulatorUpdate = (targetPhi != nullptr);
+  Value *lhsValue = isAccumulatorUpdate ? (Value *)targetPhi : (Value *)I;
+  bool needsDeclaration = !isAccumulatorUpdate && canDeclareLocalLate(*I);
+
   Out << "  ";
+
+  bool VarDeclaredInline = false;
+
   if (!isEmptyType(I->getType()) && !isInlineAsm(*I)) {
-    auto varName = GetValueName(&*I, true);
-    if (canDeclareLocalLate(*I) && !isIVIncrement(I)) {
-      errs() << "SUSAN: printing type name for " << varName << " at 6805\n";
-      printTypeName(Out, I->getType(), false) << ' ';
-      declaredLocals.insert(varName);
+
+    Value *lhsValue = targetPhi ? (Value *)targetPhi
+                                : (Value *)I; // Use PHI as LHS if applicable
+    auto varName = GetValueName(lhsValue, needsDeclaration);
+
+    if (needsDeclaration) {
+      // Check if already declared (shouldn't happen for PHI case if logic is
+      // right)
+      if (declaredLocals.find(varName) == declaredLocals.end()) {
+        // Original late declaration logic
+        errs() << "SUSAN: printing type name for " << varName
+               << " at 6805 (late decl)\n";
+        printTypeName(Out, I->getType(),
+                      /*isSigned=*/(signedInsts.find(I) != signedInsts.end()))
+            << ' ';
+        declaredLocals.insert(varName);
+        VarDeclaredInline = true; // Remember we declared it here
+      } else {
+        // Already declared earlier (e.g., at function start), just use the
+        // name. This path might be hit if canDeclareLocalLate logic isn't
+        // perfect or if targetPhi logic incorrectly returns null sometimes.
+      }
     }
-    Out << GetValueName(&*I) << " = ";
+    // If targetPhi is not null, varName is the PHI variable, which *must* have
+    // been declared earlier (either at function start or when the PHI itself
+    // was processed if we added specific PHI handling - though PHIs are usually
+    // handled via temps). We just print the assignment.
+
+    Out << varName << " = ";
   }
+
+  // writeInstComputationInline handles the RHS (the calculation)
   writeInstComputationInline(*I);
 
-  if (printSemiColon)
+  // Check if we need a semicolon (most non-terminators do)
+  // Ensure empty declarations still get a semicolon if needed.
+  if (printSemiColon || VarDeclaredInline) {
     Out << ";\n";
+  }
+
+  //  Out << "  ";
+  //  if (!isEmptyType(I->getType()) && !isInlineAsm(*I)) {
+  //    auto varName = GetValueName(&*I, true);
+  //    if (canDeclareLocalLate(*I) && !isIVIncrement(I)) {
+  //      errs() << "SUSAN: printing type name for " << varName << " at 6805\n";
+  //      printTypeName(Out, I->getType(), false) << ' ';
+  //      declaredLocals.insert(varName);
+  //    }
+  //    Out << GetValueName(&*I) << " = ";
+  //  }
+  //  writeInstComputationInline(*I);
+
+  //  if (printSemiColon)
+  //    Out << ";\n";
 }
 
 void CWriter::keepIVUnrelatedInsts(

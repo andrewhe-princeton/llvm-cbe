@@ -378,6 +378,7 @@ private:
 
 
   // SUSAN: added functions
+  PHINode* findUpdatedAccumulatorPHI(Instruction *I);
   void emitIfBlock(CBERegion *R, bool doNotPrintReturn=false, bool isElseBranch=false);
   void markLoopIrregularExits(Function &F);
   void NodeSplitting(Function &F);
