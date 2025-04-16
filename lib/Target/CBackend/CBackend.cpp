@@ -3471,111 +3471,210 @@ std::string demangleVariableName(std::string var) {
   return VarName;
 }
 std::string CWriter::GetValueName(Value *Operand, bool isDeclaration) {
-  if (isDeclaration) {
-    errs() << "SUSAN: declaring 3252: " << *Operand << "\n";
-    cnt_totalVariables++;
-  }
+std::string ResultName = ""; // Initialize result string
+    std::string Name;            // Declare Name variable here for temporary names
 
-  if (Operand->getName() == "xmalloc")
-    return "malloc";
+    // --- DEBUG START: Function Entry ---
+    std::string operandStr;
+    raw_string_ostream OS(operandStr);
+    if (Operand) OS << *Operand; else OS << "<nullptr>";
+    OS.flush();
+    errs() << "[DEBUG] GetValueName ENTER for Operand: " << operandStr;
+    if (isDeclaration) errs() << " (isDeclaration=true)";
+    errs() << "\n";
+    // --- DEBUG END ---
 
-  if (!Operand)
-    return "";
-  if (IV2Name.find(Operand) != IV2Name.end()) {
-    bool foundSourceName = false;
-    for (auto inst2var : IRNaming) {
-      if (inst2var.first == Operand) {
-        foundSourceName = true;
-        break;
-      }
-    }
-    if (!foundSourceName) {
-      errs() << "SUSAN: found in IV2Name map " << *Operand << "\n";
-      errs() << "name:  " << IV2Name[Operand] << "\n";
-      if (isDeclaration) {
-        errs() << "SUSAN: reconstructed variable counter increment for iv:"
-               << IV2Name[Operand] << "\n";
-        cnt_reconstructedVariables++;
-      }
-      return IV2Name[Operand];
-    }
-  }
-  errs() << "SUSAN: getting value name for: " << *Operand << "\n";
-  // SUSAN: variable names associated with phi will be replaced by phi
-  if (TruncInst *inst = dyn_cast<TruncInst>(Operand))
-    return GetValueName(inst->getOperand(0));
 
-  if (Instruction *inst = dyn_cast<Instruction>(Operand))
-    if (deleteAndReplaceInsts.find(inst) != deleteAndReplaceInsts.end()) {
-      return GetValueName(deleteAndReplaceInsts[inst]);
+    if (!Operand){
+       ResultName = "<null>"; // Handle null operand case
+    } else if (Operand->getName() == "xmalloc") {
+        ResultName = "malloc"; // Special case: Malloc name override
+    } else if (IV2Name.count(Operand)) { // Use .count() for check before access
+        bool foundSourceName = false;
+        for (auto const& [inst, var] : IRNaming) {
+            if (inst == Operand) {
+                foundSourceName = true;
+                break;
+            }
+        }
+        if (!foundSourceName) {
+             errs() << "[DEBUG] GetValueName: Found in IV2Name map: " << *Operand << " -> '" << IV2Name[Operand] << "'\n";
+             if (isDeclaration) {
+                 errs() << "[DEBUG] GetValueName: Reconstructed variable counter increment for iv: '" << IV2Name[Operand] << "'\n";
+                 cnt_reconstructedVariables++;
+             }
+             ResultName = IV2Name[Operand];
+        }
+        // If foundSourceName is true, fall through to check IRNaming below
     }
 
-  if (inlinedArgNames.find(Operand) != inlinedArgNames.end())
-    return inlinedArgNames[Operand];
+    // If ResultName is not set yet, continue checking other sources
+    if (ResultName.empty() && Operand) { // Added Operand check just in case
 
-  // SUSAN: where the vairable names are printed
-  for (auto inst2var : IRNaming)
-    if (inst2var.first == Operand) {
-      errs() << "inst from IRNaming: " << *inst2var.first << "\n";
-      errs() << "original name : " << inst2var.second << "\n";
-      std::string var = demangleVariableName(inst2var.second);
-      errs() << "returning name: " << var << "\n";
-      if (isDeclaration) {
-        errs() << "SUSAN: declaring with reconstructed name 3286: " << var
-               << "\n";
-        cnt_reconstructedVariables++;
-      }
-      return var;
-    }
-  // for (auto const& [var, insts] : Var2IRs)
-  // for (auto &inst : insts)
-  // if(inst == operandInst) return var;
-
-  // Resolve potential alias.
-  if (GlobalAlias *GA = dyn_cast<GlobalAlias>(Operand)) {
-    Operand = GA->getAliasee();
-  }
-
-  // use IV name for IVInc
-  // Instruction *incInst = dyn_cast<Instruction>(Operand);
-  // if(IVInc2IV.find(incInst) != IVInc2IV.end())
-  //  return GetValueName(IVInc2IV[incInst]);
-
-  std::string Name{Operand->getName()};
-  if (Name.empty()) { // Assign unique names to local temporaries.
-    unsigned No = AnonValueNumbers.getOrInsert(Operand);
-
-    Name = "_" + utostr(No);
-    if (!TheModule->getNamedValue(Name)) {
-      // Short name for the common case where there's no conflicting global.
-      return Name;
+        // Handle instructions that were replaced (e.g., skipped casts/ands)
+        if (Instruction *inst = dyn_cast<Instruction>(Operand)) {
+            if (deleteAndReplaceInsts.count(inst)) { // Use count()
+                errs() << "[DEBUG] GetValueName: Operand " << *Operand << " was replaced, getting name for: " << *deleteAndReplaceInsts[inst] << "\n";
+                ResultName = GetValueName(deleteAndReplaceInsts[inst], isDeclaration); // Recursive call
+            }
+        }
     }
 
-    Name = "tmp_" + Name;
-  }
+    // Handle arguments that were inlined
+    if (ResultName.empty() && Operand) {
+         if (inlinedArgNames.count(Operand)) { // Use count()
+             errs() << "[DEBUG] GetValueName: Found inlined argument name: '" << inlinedArgNames[Operand] << "' for: " << *Operand << "\n";
+             ResultName = inlinedArgNames[Operand];
+         }
+    }
 
-  // Mangle globals with the standard mangler interface for LLC compatibility.
-  if (isa<GlobalValue>(Operand)) {
-    return CBEMangle(Name);
-  }
 
-  std::string VarName;
-  VarName.reserve(Name.capacity());
+    // Check IRNaming (Debug Info) if name still not found
+    if (ResultName.empty() && Operand) {
+        // --- START ACCUMULATOR PHI CONFLICT DETECTION (Option A) ---
+        PHINode* phiOperand = dyn_cast<PHINode>(Operand);
+        Instruction* FAddInst = nullptr; // The FAdd/other op feeding this PHI
+        bool isAccumulatorPhi = false;
+        std::string accumulatorConflictDebugName = ""; // Name causing conflict
 
-  for (std::string::iterator I = Name.begin(), E = Name.end(); I != E; ++I) {
-    unsigned char ch = *I;
+        if (phiOperand && LI) {
+             Loop *L = LI->getLoopFor(phiOperand->getParent());
+             if (L && L->getHeader() == phiOperand->getParent()) {
+                 for (unsigned i = 0; i < phiOperand->getNumIncomingValues(); ++i) {
+                      Instruction* incomingInst = dyn_cast<Instruction>(phiOperand->getIncomingValue(i));
+                      if (incomingInst && L->contains(phiOperand->getIncomingBlock(i))) {
+                          for(unsigned opIdx = 0; opIdx < incomingInst->getNumOperands(); ++opIdx) {
+                              if (incomingInst->getOperand(opIdx) == phiOperand) {
+                                   isAccumulatorPhi = true;
+                                   FAddInst = incomingInst;
+                                   errs() << "[DEBUG] GetValueName: PHI " << *phiOperand << " identified as accumulator fed by " << *FAddInst << "\n";
+                                   break;
+                              }
+                          }
+                      }
+                      if (isAccumulatorPhi) break;
+                 }
+             }
+        }
+        // --- END ACCUMULATOR PHI DETECTION ---
 
-    if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
-          (ch >= '0' && ch <= '9') || ch == '_')) {
-      char buffer[5];
-      sprintf(buffer, "_%x_", ch);
-      VarName += buffer;
-    } else
-      VarName += ch;
-  }
+        bool foundInIRNaming = false;
+        for (auto const& [inst, var] : IRNaming) {
+            if (inst == Operand) {
+                foundInIRNaming = true;
+                std::string NameFromDebug = demangleVariableName(var);
+                errs() << "[DEBUG] GetValueName: Found mapping in IRNaming: " << *Operand << " -> '" << NameFromDebug << "'\n";
 
-  // return "_" + VarName;
-  return VarName;
+                // --- START CHECK FOR CONFLICT ---
+                if (isAccumulatorPhi && FAddInst) {
+                    bool conflict = false;
+                    for (auto const& [inst_fadd, var_fadd] : IRNaming) {
+                        if (inst_fadd == FAddInst &&
+                            demangleVariableName(var_fadd) == NameFromDebug)
+                        {
+                             errs() << "[DEBUG] GetValueName: CONFLICT DETECTED! PHI (" << *phiOperand << ") and feeding instruction (" << *FAddInst << ") both map to debug name '" << NameFromDebug << "'\n";
+                             conflict = true;
+                             accumulatorConflictDebugName = NameFromDebug;
+                             break;
+                        }
+                    }
+
+                    if (conflict) {
+                        // Conflict detected! Don't use the debug name for the PHI.
+                        unsigned No = AnonValueNumbers.getOrInsert(Operand);
+                        std::string UniqueName = "llvm_acc_" + utostr(No);
+                        errs() << "[DEBUG] GetValueName: Using unique name '" << UniqueName << "' for conflicting PHI: " << *Operand << "\n";
+                        ResultName = UniqueName;
+                        // Break out of the IRNaming loop since we found our special case
+                        break;
+                    }
+                }
+                // --- END CHECK FOR CONFLICT ---
+
+                // No conflict found, use the name from debug info
+                if (ResultName.empty()) { // Make sure we didn't set a unique name above
+                    if (isDeclaration) {
+                        errs() << "[DEBUG] GetValueName: Declaring with reconstructed name '" << NameFromDebug << "'\n";
+                        cnt_reconstructedVariables++;
+                    }
+                    ResultName = NameFromDebug;
+                }
+                // Break out of the IRNaming loop since we found a match
+                break;
+            }
+        }
+    }
+
+
+    // Resolve potential alias if name still not found
+     if (ResultName.empty() && Operand) {
+        if (GlobalAlias *GA = dyn_cast<GlobalAlias>(Operand)) {
+            errs() << "[DEBUG] GetValueName: Resolving alias " << *Operand << " to " << *(GA->getAliasee()) << "\n";
+            ResultName = GetValueName(GA->getAliasee(), isDeclaration); // Recursive call
+        }
+     }
+
+    // Generate unique names for local temporaries if no name found yet.
+     if (ResultName.empty() && Operand) {
+        if (Operand->hasName()) {
+            Name = Operand->getName().str(); // Assign existing LLVM name if available
+            errs() << "[DEBUG] GetValueName: Operand has LLVM name: '" << Name << "'\n";
+        } else {
+            unsigned No = AnonValueNumbers.getOrInsert(Operand);
+            Name = "_" + utostr(No);
+            errs() << "[DEBUG] GetValueName: Generating temporary name '" << Name << "'\n";
+            // Check for conflicts with globals (original logic)
+            if (TheModule && !TheModule->getNamedValue(Name)) {
+                // Safe to use short name
+                ResultName = Name;
+            } else {
+                // Conflict, use longer name
+                Name = "tmp_" + Name;
+                errs() << "[DEBUG] GetValueName: Using longer temporary name '" << Name << "' due to potential conflict.\n";
+                ResultName = Name; // Assign the longer name
+            }
+        }
+
+        // If we assigned Name but haven't assigned ResultName yet (e.g., wasn't a short temp name)
+        if (ResultName.empty()) {
+            // Mangle names if necessary (globals or potentially problematic chars)
+            if (isa<GlobalValue>(Operand)) {
+                errs() << "[DEBUG] GetValueName: Mangling global name '" << Name << "'\n";
+                ResultName = CBEMangle(Name);
+            } else {
+                // Demangle local names with problematic characters (original logic)
+                std::string VarName;
+                VarName.reserve(Name.capacity());
+                for (char ch : Name) { // Use range-based for loop
+                    if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                          (ch >= '0' && ch <= '9') || ch == '_'))
+                    {
+                        char buffer[5];
+                        snprintf(buffer, sizeof(buffer), "_%02x_", (unsigned char)ch); // Safer formatting
+                        VarName += buffer;
+                    } else {
+                        VarName += ch;
+                    }
+                }
+                errs() << "[DEBUG] GetValueName: Using potentially demangled local name '" << VarName << "'\n";
+                ResultName = VarName; // Assign potentially demangled name
+            }
+        }
+     }
+
+    // Final fallback if somehow still empty (should ideally not happen for valid Value*)
+    if (ResultName.empty()){
+         ResultName = "CBE_UNKNOWN_VALUE";
+         errs() << "[ERROR] GetValueName: Could not determine name for: " << operandStr << "\n";
+    }
+
+//EndDebug: // Label removed
+    // --- DEBUG START: Function Exit ---
+    errs() << "[DEBUG] GetValueName EXIT for Operand: " << operandStr << " -> returning name: '" << ResultName << "'\n";
+    // --- DEBUG END ---
+    return ResultName;  
+
+
 }
 
 /// writeInstComputationInline - Emit the computation for the specified
@@ -6969,42 +7068,90 @@ void CWriter::printCmpOperator(ICmpInst *icmp, bool negateCondition) {
 // GEMINI OUTPUT: CHECK
 // Helper function (conceptual) to find the PHI node being updated by I
 PHINode *CWriter::findUpdatedAccumulatorPHI(Instruction *I) {
-  if (!I || !I->getParent() || !LI)
+  // --- DEBUG START ---
+  errs() << "[DEBUG] findUpdatedAccumulatorPHI called for: " << *I << "\n";
+  // --- DEBUG END ---
+
+  if (!I || !I->getParent() || !LI) {
+    // --- DEBUG START ---
+    errs() << "[DEBUG] findUpdatedAccumulatorPHI: Missing I, Parent, or LI. "
+              "Returning null.\n";
+    // --- DEBUG END ---
     return nullptr;
+  }
+
   Loop *L = LI->getLoopFor(I->getParent());
-  if (!L)
+  if (!L) {
+    // --- DEBUG START ---
+    errs() << "[DEBUG] findUpdatedAccumulatorPHI: Instruction not in a loop. "
+              "Returning null.\n";
+    // --- DEBUG END ---
     return nullptr;
+  }
+
   BasicBlock *loopHeader = L->getHeader();
-  if (!loopHeader)
+  if (!loopHeader) {
+    // --- DEBUG START ---
+    errs() << "[DEBUG] findUpdatedAccumulatorPHI: Loop has no header? "
+              "Returning null.\n";
+    // --- DEBUG END ---
     return nullptr;
+  }
+  // --- DEBUG START ---
+  errs() << "[DEBUG] findUpdatedAccumulatorPHI: Loop Header: "
+         << loopHeader->getName() << "\n";
+  // --- DEBUG END ---
 
-  PHINode *potentialPhiTarget =
-      nullptr; // The PHI this instruction might be feeding
+  PHINode *potentialPhiTarget = nullptr;
 
-  // Find if any user is a PHI in the loop header
   for (User *U : I->users()) {
     if (PHINode *phiUser = dyn_cast<PHINode>(U)) {
+      // --- DEBUG START ---
+      errs() << "[DEBUG] findUpdatedAccumulatorPHI: Found user PHI: "
+             << *phiUser << " in BB: " << phiUser->getParent()->getName()
+             << "\n";
+      // --- DEBUG END ---
       if (phiUser->getParent() == loopHeader) {
+        // --- DEBUG START ---
+        errs() << "[DEBUG] findUpdatedAccumulatorPHI: Found potential target "
+                  "PHI in header: "
+               << *phiUser << "\n";
+        // --- DEBUG END ---
         potentialPhiTarget = phiUser;
-        break; // Found a potential PHI target in the header
+        break;
       }
     }
   }
 
-  if (!potentialPhiTarget)
-    return nullptr; // Instruction doesn't feed a header PHI
+  if (!potentialPhiTarget) {
+    // --- DEBUG START ---
+    errs() << "[DEBUG] findUpdatedAccumulatorPHI: Instruction does not feed a "
+              "header PHI. Returning null.\n";
+    // --- DEBUG END ---
+    return nullptr;
+  }
 
-  // Now, check if this instruction uses the *same* PHI as an operand
   for (unsigned opIdx = 0; opIdx < I->getNumOperands(); ++opIdx) {
+    // --- DEBUG START ---
+    errs() << "[DEBUG] findUpdatedAccumulatorPHI: Checking operand #" << opIdx
+           << ": " << *(I->getOperand(opIdx)) << "\n";
+    // --- DEBUG END ---
     if (I->getOperand(opIdx) == potentialPhiTarget) {
-      // Confirmation: I uses the PHI it feeds back into
+      // --- DEBUG START ---
+      errs() << "[DEBUG] findUpdatedAccumulatorPHI: Match found! Operand is "
+                "the target PHI. Returning PHI: "
+             << *potentialPhiTarget << "\n";
+      // --- DEBUG END ---
       return potentialPhiTarget;
     }
   }
 
-  return nullptr; // Didn't find the direct feedback pattern
-} // namespace llvm_cbe
-
+  // --- DEBUG START ---
+  errs() << "[DEBUG] findUpdatedAccumulatorPHI: Did not find PHI as operand. "
+            "Returning null.\n";
+  // --- DEBUG END ---
+  return nullptr;
+}
 void CWriter::printInstruction(Instruction *I, bool printSemiColon) {
   if (I->getMetadata("tulip.target.end.of.map"))
     return;
